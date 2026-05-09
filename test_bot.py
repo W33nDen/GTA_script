@@ -1,208 +1,115 @@
 """
-test_bot.py — Тестовий скрипт для перевірки логіки розпізнавання QTE-бота.
+test_bot.py — Тестовий скрипт для перевірки розпізнавання QTE-бота.
 
 Як користуватися:
-  1. Створіть папку  test_images/  поруч із цим файлом.
-  2. Покладіть туди .png або .jpg скріншоти з гри (той самий фрагмент,
-     який потрапляє у MONITOR бота — кружечок з літерою).
-  3. Запустіть:  python test_bot.py
-  4. У консолі побачите детальний звіт по кожному зображенню.
+  1. Покладіть скріншоти з гри (.png/.jpg) у папку test_images/.
+  2. Запустіть:  python test_bot.py
+  3. Скрипт виведе, яку літеру розпізнав OCR на кожному зображенні.
 
-Якщо в папці test_images/ немає зображень, скрипт автоматично
-згенерує 4 тестові зображення, що імітують QTE з гри.
+Якщо папка test_images/ порожня — скрипт автоматично згенерує
+тестові зображення для ВСІХ 26 літер (A–Z).
 """
 
 import os
 import sys
 import cv2
 import numpy as np
+import pytesseract
+import string
 
 # ---------------------------------------------------------------------------
-# Генерація шаблонів — ДЗЕРКАЛЮЄ логіку з qte_bot_auto.py
-# (мульти-шрифтовий підхід: 5 шрифтів × 6 товщин × 4 масштаби)
+# Шлях до Tesseract (має збігатися з qte_bot_auto.py)
 # ---------------------------------------------------------------------------
-THRESHOLD_VALUE = 140        # Поріг бінаризації  (такий самий, як у боті)
-MATCH_SCORE_LIMIT = 0.25     # Поріг збігу        (такий самий, як у боті)
-MIN_SIDE = 15                # Мін. розмір контуру
-MAX_SIDE = 80                # Макс. розмір контуру
+pytesseract.pytesseract.tesseract_cmd = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+)
+
+# ---------------------------------------------------------------------------
+# Параметри обробки — ДЗЕРКАЛЮЮТЬ qte_bot_auto.py
+# ---------------------------------------------------------------------------
+THRESHOLD_VALUE = 140
+VALID_CHARS = set(string.ascii_lowercase)
 
 
-def create_internal_templates():
+def preprocess(img_bgr: np.ndarray) -> np.ndarray:
     """
-    Створює еталонні геометричні контури для літер W, A, S, D у пам'яті.
-    Повністю повторює логіку з qte_bot_auto.py.
+    Та сама обробка, що й у боті, але для BGR (cv2.imread),
+    а не BGRA (mss.grab).
     """
-    fonts = [
-        cv2.FONT_HERSHEY_SIMPLEX,
-        cv2.FONT_HERSHEY_DUPLEX,
-        cv2.FONT_HERSHEY_COMPLEX,
-        cv2.FONT_HERSHEY_TRIPLEX,
-        cv2.FONT_HERSHEY_COMPLEX_SMALL,
-    ]
-    thicknesses = [1, 2, 3, 4, 5, 6]
-    scales = [1.5, 2, 2.5, 3]
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    _, thresh = cv2.threshold(gray, THRESHOLD_VALUE, 255, cv2.THRESH_BINARY)
+    inverted = cv2.bitwise_not(thresh)
+    padded = cv2.copyMakeBorder(inverted, 20, 20, 20, 20,
+                                cv2.BORDER_CONSTANT, value=255)
+    return padded
 
-    templates = {}
-    for char in ['w', 'a', 's', 'd']:
-        char_contours = []
-        for font in fonts:
-            for thickness in thicknesses:
-                for scale in scales:
-                    img = np.zeros((120, 120), dtype=np.uint8)
-                    cv2.putText(img, char.upper(), (10, 100), font, scale, 255, thickness)
-                    contours, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    if contours:
-                        char_contours.append(max(contours, key=cv2.contourArea))
-        templates[char] = char_contours
-    return templates
+
+def recognize_char(image: np.ndarray) -> str | None:
+    """Розпізнає один символ (PSM 10 + whitelist A-Z + 01 fallback)."""
+    config = (
+        "--psm 10 "
+        "-c tesseract_char_whitelist="
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz01"
+    )
+    text = pytesseract.image_to_string(image, config=config).strip().lower()
+
+    # Фолбек для відомих помилок Tesseract (I↔1, O↔0)
+    CONFUSION_MAP = {"0": "o", "1": "i"}
+    text = CONFUSION_MAP.get(text, text)
+
+    if len(text) == 1 and text in VALID_CHARS:
+        return text
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Генерація тестових зображень, що імітують QTE з гри
+# Генерація тестових зображень
 # ---------------------------------------------------------------------------
-def generate_test_images(out_dir):
-    """Генерує 4 тестові зображення (W, A, S, D) з темним фоном і колом."""
+def generate_test_images(out_dir: str):
+    """
+    Генерує 26 тестових зображень (A–Z), що імітують QTE з гри:
+    темний фон, напівпрозоре коло, біла літера.
+    """
     os.makedirs(out_dir, exist_ok=True)
-    for char in ['W', 'A', 'S', 'D']:
-        img = np.zeros((150, 150, 3), dtype=np.uint8)
-        img[:] = (40, 45, 40)   # Темно-зелений фон (як у GTA)
-        cv2.circle(img, (75, 75), 45, (120, 120, 120), 2)
-        cv2.circle(img, (75, 75), 44, (80, 80, 80), -1)
-        font = cv2.FONT_HERSHEY_DUPLEX
-        ts = cv2.getTextSize(char, font, 1.8, 2)[0]
-        tx = 75 - ts[0] // 2
-        ty = 75 + ts[1] // 2
-        cv2.putText(img, char, (tx, ty), font, 1.8, (255, 255, 255), 2)
+    for char in string.ascii_uppercase:
+        img = np.zeros((200, 200, 3), dtype=np.uint8)
+        img[:] = (40, 45, 40)
+        cv2.circle(img, (100, 100), 60, (120, 120, 120), 2)
+        cv2.circle(img, (100, 100), 59, (80, 80, 80), -1)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        ts = cv2.getTextSize(char, font, 2.2, 4)[0]
+        tx = 100 - ts[0] // 2
+        ty = 100 + ts[1] // 2
+        cv2.putText(img, char, (tx, ty), font, 2.2, (255, 255, 255), 4)
         path = os.path.join(out_dir, f"qte_{char.lower()}.png")
         cv2.imwrite(path, img)
-    print(f"   Згенеровано 4 тестові зображення у {out_dir}")
+    print(f"   Згенеровано 26 тестових зображень (A–Z) у {out_dir}")
 
 
 # ---------------------------------------------------------------------------
-# Аналіз одного зображення — ДЗЕРКАЛЮЄ process_frame
-# ---------------------------------------------------------------------------
-def analyze_image(filepath: str, templates: dict) -> dict:
-    """
-    Прогоняє одне зображення через ту саму логіку, що й бот:
-      threshold → findContours → matchShapes (I3, multi-font).
-    """
-    img = cv2.imread(filepath)
-    if img is None:
-        return {"file": filepath, "error": "Не вдалося прочитати файл"}
-
-    img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(img_gray, THRESHOLD_VALUE, 255, cv2.THRESH_BINARY)
-
-    contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-
-    results = {
-        "file": os.path.basename(filepath),
-        "resolution": f"{img.shape[1]}x{img.shape[0]}",
-        "total_contours": len(contours),
-        "candidates": [],
-        "detected": None,
-    }
-
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-
-        if w < MIN_SIDE or h < MIN_SIDE or w > MAX_SIDE or h > MAX_SIDE:
-            continue
-
-        aspect_ratio = float(w) / h
-        if aspect_ratio < 0.3 or aspect_ratio > 2.5:
-            continue
-
-        # --- Мульти-шрифтове порівняння (метод I3) ---
-        scores_best = {}
-        best_char = None
-        best_score = float('inf')
-
-        for char, char_contours in templates.items():
-            min_score_for_char = float('inf')
-            for temp_cnt in char_contours:
-                score = cv2.matchShapes(temp_cnt, cnt, cv2.CONTOURS_MATCH_I3, 0)
-                min_score_for_char = min(min_score_for_char, score)
-            scores_best[char] = round(min_score_for_char, 4)
-            if min_score_for_char < best_score:
-                best_score = min_score_for_char
-                best_char = char
-
-        candidate = {
-            "bbox": f"x={x} y={y} w={w} h={h}",
-            "aspect_ratio": round(aspect_ratio, 2),
-            "best_char": best_char.upper(),
-            "best_score": round(best_score, 4),
-            "all_scores": scores_best,
-            "accepted": best_score < MATCH_SCORE_LIMIT,
-        }
-        results["candidates"].append(candidate)
-
-        if candidate["accepted"] and results["detected"] is None:
-            results["detected"] = best_char.upper()
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# Форматований вивід
-# ---------------------------------------------------------------------------
-def print_report(res: dict):
-    """Красиво друкує результат аналізу одного зображення."""
-
-    print(f"\n{'=' * 60}")
-    print(f"📄 Файл: {res['file']}")
-
-    if "error" in res:
-        print(f"   ❌ ПОМИЛКА: {res['error']}")
-        return
-
-    print(f"   Роздільна здатність: {res['resolution']}")
-    print(f"   Знайдено контурів (усього): {res['total_contours']}")
-    print(f"   Кандидатів після фільтрів:  {len(res['candidates'])}")
-
-    if not res["candidates"]:
-        print("   ⚠️  Жоден контур не пройшов фільтри розміру/пропорцій.")
-        print("       → Спробуйте зменшити THRESHOLD_VALUE (наприклад, зі 140 до 100)")
-        print("       → або перевірте, чи зображення містить літеру у правильній області.")
-        return
-
-    for i, c in enumerate(res["candidates"], 1):
-        status = "✅ ПРИЙНЯТО" if c["accepted"] else "❌ Відхилено (score > 0.25)"
-        print(f"\n   --- Кандидат #{i} ---")
-        print(f"   Рамка:       {c['bbox']}")
-        print(f"   Пропорції:   {c['aspect_ratio']}")
-        print(f"   Найкращий:   {c['best_char']}  (score = {c['best_score']})")
-        print(f"   Статус:      {status}")
-        print(f"   Усі score:   W={c['all_scores']['w']}  A={c['all_scores']['a']}  "
-              f"S={c['all_scores']['s']}  D={c['all_scores']['d']}")
-
-        if c["accepted"] and c["best_score"] > 0.18:
-            print(f"   ⚠️  Score близький до ліміту (0.25). "
-                  f"Можливі неточності у реальній грі.")
-
-    print(f"\n   🎯 ФІНАЛЬНИЙ РЕЗУЛЬТАТ: ", end="")
-    if res["detected"]:
-        print(f"Бот натисне  [ {res['detected']} ]")
-    else:
-        print("Бот НЕ натисне нічого (жоден кандидат не пройшов поріг 0.25)")
-
-
-# ---------------------------------------------------------------------------
-# main
+# Основна логіка тестування
 # ---------------------------------------------------------------------------
 def main():
     test_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_images")
 
     print("=" * 60)
-    print("🧪  Тестовий скрипт для QTE-бота (мульти-шрифтовий метод)")
+    print("🧪  Тестовий скрипт для QTE-бота (Tesseract OCR)")
     print("=" * 60)
-    print(f"Папка з тестовими зображеннями: {test_dir}")
-    print(f"Поріг бінаризації (THRESHOLD):   {THRESHOLD_VALUE}")
-    print(f"Поріг збігу (MATCH_SCORE_LIMIT): {MATCH_SCORE_LIMIT}")
-    print(f"Метод порівняння:                CONTOURS_MATCH_I3")
 
-    # Перевіряємо наявність папки та зображень
+    # Перевірка Tesseract
+    try:
+        ver = pytesseract.get_tesseract_version()
+        print(f"Tesseract знайдено: v{ver}")
+    except pytesseract.TesseractNotFoundError:
+        print("\n❌ ПОМИЛКА: Tesseract OCR не знайдено!")
+        print(f"   Очікуваний шлях: {pytesseract.pytesseract.tesseract_cmd}")
+        print("   Встановіть його за інструкцією з README.md")
+        sys.exit(1)
+
+    print(f"Папка з тестовими зображеннями: {test_dir}")
+    print(f"Поріг бінаризації: {THRESHOLD_VALUE}")
+
+    # Перевірка наявності зображень
     valid_ext = ('.png', '.jpg', '.jpeg', '.bmp')
     need_generate = False
 
@@ -223,39 +130,59 @@ def main():
         for f in os.listdir(test_dir)
         if f.lower().endswith(valid_ext)
     ])
+    print(f"Знайдено зображень: {len(files)}")
 
-    print(f"\nЗнайдено зображень: {len(files)}")
-
-    # Генеруємо шаблони
-    print("Генерація мульти-шрифтових шаблонів...")
-    templates = create_internal_templates()
-    total_variants = sum(len(v) for v in templates.values())
-    print(f"Згенеровано {total_variants} варіантів ({total_variants // 4} на літеру)")
-
-    # Аналізуємо
+    # Аналізуємо кожне
     total = len(files)
-    detected_count = 0
+    success = 0
+    failures = []
+
+    print(f"\n{'Файл':<25} {'Результат':<15} {'Статус'}")
+    print("-" * 55)
 
     for filepath in files:
-        res = analyze_image(filepath, templates)
-        print_report(res)
-        if res.get("detected"):
-            detected_count += 1
+        fname = os.path.basename(filepath)
+        img = cv2.imread(filepath)
+        if img is None:
+            print(f"{fname:<25} {'Помилка читання':<15} ❌")
+            failures.append(fname)
+            continue
+
+        processed = preprocess(img)
+        char = recognize_char(processed)
+
+        if char:
+            # Спробуємо визначити очікувану літеру з імені файлу (qte_a.png → a)
+            expected = None
+            base = os.path.splitext(fname)[0].lower()
+            if base.startswith("qte_") and len(base) == 5:
+                expected = base[-1]
+
+            if expected and char == expected:
+                status = "✅"
+            elif expected and char != expected:
+                status = f"⚠️  (очікувалось {expected.upper()})"
+            else:
+                status = "✅"
+
+            print(f"{fname:<25} {char.upper():<15} {status}")
+            success += 1
+        else:
+            print(f"{fname:<25} {'—':<15} ❌ Не розпізнано")
+            failures.append(fname)
 
     # Підсумок
-    print(f"\n{'=' * 60}")
-    print(f"📊  ПІДСУМОК: Розпізнано {detected_count}/{total} зображень")
-    if detected_count == total:
-        print("🎉  Усі зображення розпізнані успішно! Бот готовий до роботи.")
-    elif detected_count == 0:
-        print("😞  Жодне зображення не розпізнано.")
+    print(f"\n{'=' * 55}")
+    print(f"📊  ПІДСУМОК: Розпізнано {success}/{total} зображень")
+
+    if success == total:
+        print("🎉  Усі літери розпізнані! Бот готовий до роботи.")
+    elif failures:
+        print(f"❌  Не вдалось розпізнати: {', '.join(failures)}")
         print("    Поради:")
-        print("    1. Переконайтесь, що скріншоти містять кружечок з літерою.")
-        print("    2. Спробуйте знизити THRESHOLD_VALUE (рядок 27) зі 140 до 100.")
-        print("    3. Спробуйте підвищити MATCH_SCORE_LIMIT (рядок 28) з 0.25 до 0.35.")
-    else:
-        print(f"    Деякі зображення не розпізнані — перевірте звіт вище.")
-    print("=" * 60)
+        print(f"    1. Зменшіть THRESHOLD_VALUE (зараз {THRESHOLD_VALUE}) до 100 або 80.")
+        print("    2. Переконайтесь, що на скріншоті є чітка біла літера.")
+    print("=" * 55)
 
 
 if __name__ == "__main__":

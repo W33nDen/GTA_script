@@ -1,127 +1,117 @@
+"""
+qte_bot_auto.py — Автоматичний бот для QTE міні-ігор.
+
+Розпізнає БУДЬ-ЯКУ літеру (A–Z) через Tesseract OCR (режим одиночного символу)
+та натискає відповідну клавішу через DirectInput.
+
+Залежності:  pip install mss numpy opencv-python pytesseract pydirectinput keyboard
+Додатково:   Tesseract OCR (див. README.md для інструкції зі встановлення)
+"""
+
 import mss
 import numpy as np
+import cv2
+import pytesseract
 import pydirectinput
 import keyboard
 import time
-import cv2
+import string
 
-# ================= НАЛАШТУВАННЯ =================
-# Координати області, де з'являється літера (кружечок із QTE).
-# ⚠️ Обов'язково підлаштуйте під свою роздільну здатність!
-# Дивіться README.md для інструкції, як знайти правильні координати.
+# ======================== НАЛАШТУВАННЯ ========================
+
+# Шлях до Tesseract OCR (Windows).
+# Якщо ви встановили Tesseract за іншим шляхом — змініть тут.
+pytesseract.pytesseract.tesseract_cmd = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+)
+
+# Координати зони на екрані, де з'являється літера (кружечок QTE).
+# ⚠️  ОБОВ'ЯЗКОВО підлаштуйте під свою роздільну здатність!
+# Дивіться README.md для покрокової інструкції.
 MONITOR = {"top": 400, "left": 800, "width": 150, "height": 150}
 
-# Поріг бінаризації (яскравість пікселів). Якщо бот не бачить літеру,
-# зменшіть це значення (наприклад, зі 140 до 100).
+# Поріг бінаризації (яскравість). Якщо бот не бачить літеру — зменшіть (100, 80).
 THRESHOLD_VALUE = 140
 
-# Поріг збігу форми. Чим менше — тим суворіше.
-# Не рекомендується ставити вище 0.5.
-MATCH_SCORE_LIMIT = 0.25
+# Множина допустимих символів
+VALID_CHARS = set(string.ascii_lowercase)  # {'a', 'b', ..., 'z'}
 
-# Мін/макс розмір контуру (у пікселях). Фільтрує шум та велике коло.
-MIN_CONTOUR_SIDE = 15
-MAX_CONTOUR_SIDE = 80
-# ================================================
+# =============================================================
 
 
-def create_internal_templates():
+def preprocess(img_bgra: np.ndarray) -> np.ndarray:
     """
-    Створює еталонні геометричні контури для літер W, A, S, D у пам'яті.
-
-    Використовує КІЛЬКА варіантів шрифтів та товщин ліній, щоб покрити
-    максимальну кількість можливих ігрових шрифтів. Для порівняння
-    використовується метод Hu Moments (cv2.CONTOURS_MATCH_I3), який
-    інваріантний до масштабу, повороту та дзеркального відображення.
+    Підготовлює скріншот для Tesseract:
+      1. Переводить у відтінки сірого.
+      2. Бінаризує (біла літера → біла, темний фон → чорний).
+      3. Інвертує (Tesseract найкраще працює з ТЕМНИМ текстом на БІЛОМУ фоні).
+      4. Додає білу рамку навколо (padding) — Tesseract потребує відступи.
     """
-    fonts = [
-        cv2.FONT_HERSHEY_SIMPLEX,
-        cv2.FONT_HERSHEY_DUPLEX,
-        cv2.FONT_HERSHEY_COMPLEX,
-        cv2.FONT_HERSHEY_TRIPLEX,
-        cv2.FONT_HERSHEY_COMPLEX_SMALL,
-    ]
-    thicknesses = [1, 2, 3, 4, 5, 6]
-    scales = [1.5, 2, 2.5, 3]
-
-    templates = {}
-    for char in ['w', 'a', 's', 'd']:
-        char_contours = []
-        for font in fonts:
-            for thickness in thicknesses:
-                for scale in scales:
-                    img = np.zeros((120, 120), dtype=np.uint8)
-                    cv2.putText(img, char.upper(), (10, 100), font, scale, 255, thickness)
-                    contours, _ = cv2.findContours(img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    if contours:
-                        char_contours.append(max(contours, key=cv2.contourArea))
-        templates[char] = char_contours
-    return templates
+    gray = cv2.cvtColor(img_bgra, cv2.COLOR_BGRA2GRAY)
+    _, thresh = cv2.threshold(gray, THRESHOLD_VALUE, 255, cv2.THRESH_BINARY)
+    inverted = cv2.bitwise_not(thresh)
+    padded = cv2.copyMakeBorder(inverted, 20, 20, 20, 20,
+                                cv2.BORDER_CONSTANT, value=255)
+    return padded
 
 
-def process_frame(sct, templates):
-    """Захоплює область екрана, шукає літеру QTE та натискає відповідну клавішу."""
-    # 1. Захоплення екрана
+def recognize_char(image: np.ndarray) -> str | None:
+    """
+    Розпізнає один символ на зображенні.
+
+    Використовує Tesseract у режимі PSM 10 (одиночний символ) із білим списком
+    A–Z + цифри 0/1 (Tesseract часто плутає I↔1 та O↔0).
+    """
+    config = (
+        "--psm 10 "
+        "-c tesseract_char_whitelist="
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz01"
+    )
+    text = pytesseract.image_to_string(image, config=config).strip().lower()
+
+    # Фолбек для відомих помилок Tesseract
+    CONFUSION_MAP = {"0": "o", "1": "i"}
+    text = CONFUSION_MAP.get(text, text)
+
+    if len(text) == 1 and text in VALID_CHARS:
+        return text
+    return None
+
+
+def process_frame(sct):
+    """Захоплює область екрана, розпізнає літеру та натискає клавішу."""
     screenshot = sct.grab(MONITOR)
     img_np = np.array(screenshot)
-    img_gray = cv2.cvtColor(img_np, cv2.COLOR_BGRA2GRAY)
 
-    # 2. Бінаризація: все яскравіше за THRESHOLD_VALUE стає білим
-    _, thresh = cv2.threshold(img_gray, THRESHOLD_VALUE, 255, cv2.THRESH_BINARY)
+    processed = preprocess(img_np)
+    char = recognize_char(processed)
 
-    # 3. Пошук контурів. RETR_LIST бачить ВСЕ (і коло, і літеру всередині).
-    contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-
-    for cnt in contours:
-        x, y, w, h = cv2.boundingRect(cnt)
-
-        # ФІЛЬТР 1: Розмір — відсіює велике зовнішнє коло та дрібний шум
-        if w < MIN_CONTOUR_SIDE or h < MIN_CONTOUR_SIDE:
-            continue
-        if w > MAX_CONTOUR_SIDE or h > MAX_CONTOUR_SIDE:
-            continue
-
-        # ФІЛЬТР 2: Пропорції — літери приблизно квадратні
-        aspect_ratio = float(w) / h
-        if aspect_ratio < 0.3 or aspect_ratio > 2.5:
-            continue
-
-        # 4. Порівняння з усіма варіантами шаблонів (мульти-шрифт)
-        best_char = None
-        best_score = float('inf')
-
-        for char, char_contours in templates.items():
-            for temp_cnt in char_contours:
-                # CONTOURS_MATCH_I3 — найстабільніший метод для різних шрифтів
-                score = cv2.matchShapes(temp_cnt, cnt, cv2.CONTOURS_MATCH_I3, 0)
-                if score < best_score:
-                    best_score = score
-                    best_char = char
-
-        # 5. Якщо форма достатньо схожа на одну з літер — натискаємо
-        if best_score < MATCH_SCORE_LIMIT:
-            print(f"[{time.strftime('%H:%M:%S')}] Знайдено: {best_char.upper()} "
-                  f"(точність: {best_score:.3f}) → Натискаю!")
-            pydirectinput.press(best_char)
-            time.sleep(0.5)  # Затримка проти подвійного натискання
-            return
+    if char:
+        print(f"[{time.strftime('%H:%M:%S')}] Розпізнано: {char.upper()} → Натискаю!")
+        pydirectinput.press(char)
+        time.sleep(0.3)  # Затримка проти подвійного натискання
 
 
 def main():
     print("=" * 55)
-    print("  Автоматичний бот для QTE міні-ігор")
-    print("  Метод: мульти-шрифтовий аналіз контурів (OpenCV)")
+    print("  QTE Bot — Автоматичне проходження міні-ігор")
+    print("  OCR: Tesseract (PSM 10 — режим одиночного символу)")
     print("=" * 55)
-    print("Ініціалізація шаблонів...")
 
-    templates = create_internal_templates()
-    total = sum(len(v) for v in templates.values())
-    print(f"Згенеровано {total} варіантів шаблонів ({total // 4} на літеру)")
+    # Перевірка доступності Tesseract
+    try:
+        ver = pytesseract.get_tesseract_version()
+        print(f"  Tesseract знайдено: v{ver}")
+    except pytesseract.TesseractNotFoundError:
+        print("\n❌ ПОМИЛКА: Tesseract OCR не знайдено!")
+        print("   Встановіть його за інструкцією з README.md")
+        print(f"   Очікуваний шлях: {pytesseract.pytesseract.tesseract_cmd}")
+        return
 
     print("-" * 55)
-    print(" Гарячі клавіші:")
-    print("   F8  — ЗАПУСК / ПАУЗА сканування")
-    print("   F9  — ЗАКРИТИ програму")
+    print("  Гарячі клавіші:")
+    print("    F8  — ЗАПУСК / ПАУЗА сканування")
+    print("    F9  — ЗАКРИТИ програму")
     print("-" * 55)
 
     running = False
@@ -139,7 +129,7 @@ def main():
                 break
 
             if running:
-                process_frame(sct, templates)
+                process_frame(sct)
 
             time.sleep(0.01)
 
